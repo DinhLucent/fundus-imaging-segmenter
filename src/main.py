@@ -53,6 +53,10 @@ class BoundingBox:
     def to_dict(self) -> Dict[str, int]:
         return {"x": self.x, "y": self.y, "w": self.w, "h": self.h}
 
+    def __repr__(self) -> str:
+        return f"BoundingBox(x={self.x}, y={self.y}, w={self.w}, h={self.h}, area={self.area})"
+
+
 
 @dataclass
 class SegmentationResult:
@@ -83,6 +87,10 @@ class SegmentationResult:
             "metrics": self.metrics,
         }
         return d
+
+    def __repr__(self) -> str:
+        return f"SegmentationResult(shape={self.image_shape}, lesions={self.lesion_count}, has_od={self.optic_disc_bbox is not None})"
+
 
 
 # ---------------------------------------------------------------------------
@@ -246,18 +254,16 @@ class OpticDiscSegmenter:
 
     @staticmethod
     def _smooth(image: np.ndarray, kernel_size: int = 15) -> np.ndarray:
-        """Box-filter approximation of Gaussian smoothing."""
+        """Vectorized Box-filter smoothing."""
         k = kernel_size
-        kernel = np.ones((k, k), dtype=np.float64) / (k * k)
-        # Naive 2D convolution with padding
         pad = k // 2
         padded = np.pad(image, pad, mode="reflect")
-        h, w = image.shape
-        result = np.zeros_like(image)
-        for i in range(h):
-            for j in range(w):
-                result[i, j] = np.sum(padded[i:i+k, j:j+k] * kernel)
-        return result
+        
+        # Use sliding_window_view for vectorized convolution
+        # (modern NumPy 1.20+)
+        from numpy.lib.stride_tricks import sliding_window_view
+        windows = sliding_window_view(padded, (k, k))
+        return windows.mean(axis=(2, 3))
 
     @staticmethod
     def _compute_bbox(mask: np.ndarray) -> Optional[BoundingBox]:
@@ -405,15 +411,12 @@ class LesionSegmenter:
 
     @staticmethod
     def _estimate_background(image: np.ndarray, window: int = 31) -> np.ndarray:
-        """Estimate local background via box filter (approximates morphological closing)."""
+        """Vectorized background estimation via box filter."""
+        from numpy.lib.stride_tricks import sliding_window_view
         pad = window // 2
         padded = np.pad(image, pad, mode="reflect")
-        h, w = image.shape
-        result = np.zeros_like(image)
-        for i in range(h):
-            for j in range(w):
-                result[i, j] = padded[i:i+window, j:j+window].mean()
-        return result
+        windows = sliding_window_view(padded, (window, window))
+        return windows.mean(axis=(2, 3))
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +575,34 @@ def specificity(pred: np.ndarray, ground_truth: np.ndarray) -> float:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+def print_clinical_summary(result: SegmentationResult) -> None:
+    print("\n" + "═" * 50)
+    print("  FUNDUS SCREENING CLINICAL SUMMARY")
+    print("═" * 50)
+    
+    metrics = result.metrics
+    
+    print(f"  IMAGE DATA")
+    print(f"  ├─ Resolution : {result.width} x {result.height}")
+    print(f"  └─ Status     : {'PROCESSED'}")
+    
+    print(f"\n  ANATOMY")
+    od_status = "FOUND" if result.optic_disc_bbox else "NOT DETECTED"
+    print(f"  ├─ Optic Disc : {od_status}")
+    if result.optic_disc_bbox:
+        print(f"  │  └─ Area    : {metrics.get('disc_area_fraction', 0)*100:>.2f}% of retina")
+    print(f"  └─ Vasculature: {metrics.get('vessel_density', 0)*100:>.2f}% density")
+    
+    print(f"\n  PATHOLOGY")
+    print(f"  ├─ Lesions    : {int(result.lesion_count)}")
+    level = "NORMAL" if result.lesion_count == 0 else "ACTION REQUIRED" if result.lesion_count > 5 else "MONITOR"
+    print(f"  └─ Risk Level : {level}")
+    
+    print("═" * 50)
+    print(f"  Disclaimer: AI-generated screening aid. Not for diagnosis.")
+    print("═" * 50 + "\n")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     import argparse
 
@@ -589,9 +620,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         default="all",
     )
     seg.add_argument("--json", action="store_true", dest="json_output")
+    seg.add_argument("--summary", action="store_true", help="Print clinical summary")
 
     # demo command
-    subparsers.add_parser("demo", help="Run demo on a synthetic image")
+    demo = subparsers.add_parser("demo", help="Run demo on a synthetic image")
+    demo.add_argument("--summary", action="store_true", help="Print clinical summary")
 
     # metrics command
     met = subparsers.add_parser("metrics", help="Evaluate segmentation against ground truth")
@@ -615,6 +648,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if args.json_output:
             print(json.dumps(result.to_dict(), indent=2))
+        elif args.summary:
+            print_clinical_summary(result)
         else:
             print("\n=== Fundus Segmentation Result ===")
             r = result.to_dict()
@@ -638,11 +673,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         segmenter = FundusImagingSegmenter()
         result = segmenter.segment(image, target=SegmentationTarget.ALL)
 
-        print(f"  Shape        : {result.image_shape}")
-        print(f"  Disc bbox    : {result.optic_disc_bbox}")
-        print(f"  Vessel pixels: {result.vessel_mask.sum() if result.vessel_mask is not None else 0}")
-        print(f"  Lesion count : {result.lesion_count}")
-        print(f"  Metrics      : {result.metrics}")
+        if args.summary:
+            print_clinical_summary(result)
+        else:
+            print(f"  Shape        : {result.image_shape}")
+            print(f"  Disc bbox    : {result.optic_disc_bbox}")
+            print(f"  Vessel pixels: {result.vessel_mask.sum() if result.vessel_mask is not None else 0}")
+            print(f"  Lesion count : {result.lesion_count}")
+            print(f"  Metrics      : {result.metrics}")
         return 0
 
     elif args.command == "metrics":
